@@ -25,7 +25,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await jukebox.async_setup()
 
-    await hass.config_entries.async_forward_entry_setups(entry, ["text", "button", "select"])
+    await hass.config_entries.async_forward_entry_setups(entry, ["text", "select", "button"])
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
@@ -35,7 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(
-        entry, ["text", "button", "select"]
+        entry, ["text", "select", "button"]  
     )
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
@@ -105,7 +105,8 @@ class RFIDJukebox:
                     if isinstance(mapping, dict):
                         alias = mapping.get("alias", new_tag)
                         media_type = mapping.get("type", "playlist")
-                        media_name = mapping.get("name", "")
+                        # MODIFICATION : Gérer à la fois 'name' et 'uri'
+                        media_name = mapping.get("name", mapping.get("uri", ""))
                         if self.text_entity:
                             self.text_entity.update_value(media_name)
                         if self.alias_entity:
@@ -141,12 +142,18 @@ class RFIDJukebox:
                     if new_tag in self.mappings:
                         mapping = self.mappings[new_tag]
                         media_type = mapping.get("type", "playlist")
-                        media_name = mapping.get("name")
-                        if media_name:
-                            if media_type == "folder":
-                                await self.async_start_new_folder(media_name)
-                            else:
-                                await self.async_start_new_playlist(media_name)
+                        # MODIFICATION : Support des radios
+                        if media_type == "radio":
+                            uri = mapping.get("uri")
+                            if uri:
+                                await self.async_start_radio(uri)
+                        else:
+                            media_name = mapping.get("name")
+                            if media_name:
+                                if media_type == "folder":
+                                    await self.async_start_new_folder(media_name)
+                                else:
+                                    await self.async_start_new_playlist(media_name)
             # Otherwise, it's a new media.
             else:
                 self.current_tag = new_tag
@@ -154,18 +161,30 @@ class RFIDJukebox:
                     mapping = self.mappings[new_tag]
                     if isinstance(mapping, dict):
                         media_type = mapping.get("type", "playlist")
-                        media_name = mapping.get("name")
+                        # MODIFICATION : Support des radios
+                        if media_type == "radio":
+                            uri = mapping.get("uri")
+                            if uri:
+                                await self.async_start_radio(uri)
+                            else:
+                                _LOGGER.warning("No URI found for radio tag: %s", new_tag)
+                        else:
+                            media_name = mapping.get("name")
+                            if media_name:
+                                if media_type == "folder":
+                                    await self.async_start_new_folder(media_name)
+                                else:
+                                    await self.async_start_new_playlist(media_name)
+                            else:
+                                _LOGGER.warning("No media name found for tag: %s", new_tag)
                     else:
                         media_type = "playlist"
                         media_name = mapping
 
-                    if media_name:
-                        if media_type == "folder":
-                            await self.async_start_new_folder(media_name)
-                        else:
+                        if media_name:
                             await self.async_start_new_playlist(media_name)
-                    else:
-                        _LOGGER.warning("No media name found for tag: %s", new_tag)
+                        else:
+                            _LOGGER.warning("No media name found for tag: %s", new_tag)
                 else:
                     _LOGGER.warning("Unmapped tag scanned: %s", new_tag)
         # Tag is removed
@@ -237,6 +256,31 @@ class RFIDJukebox:
             else:
                 raise
 
+    async def async_start_radio(self, uri: str):
+        """Start playing a radio station."""
+        _LOGGER.info("Starting radio with URI: %s", uri)
+        from homeassistant.exceptions import HomeAssistantError
+
+        try:
+            service_data = {
+                "entity_id": self.config[CONF_MEDIA_PLAYER],
+                "media_id": uri,
+                "media_type": "radio",
+            }
+            _LOGGER.debug("Calling music_assistant.play_media with data: %s", service_data)
+            await self.hass.services.async_call(
+                "music_assistant",
+                "play_media",
+                service_data,
+                blocking=True,
+            )
+        except HomeAssistantError as err:
+            _LOGGER.error(
+                "Error playing radio '%s': %s. Please ensure the URI is correct.",
+                uri,
+                err,
+            )
+
     async def async_resume_playback(self):
         """Resume the currently paused media player."""
         _LOGGER.info("Resuming playback")
@@ -257,24 +301,34 @@ class RFIDJukebox:
             blocking=True,
         )
 
-    async def async_map_tag(self, tag_id: str, media_type: str, media_name: str, alias: str = None):
+    async def async_map_tag(self, tag_id: str, media_type: str, media_name: str = None, alias: str = None, uri: str = None):
         """Map a tag to a media item and save it."""
         from .helpers import save_mappings
 
-        if not tag_id or not media_name:
-            _LOGGER.error(
-                "Cannot map tag. Tag ID or Media Name is missing. Tag: '%s', Media: '%s'",
-                tag_id,
-                media_name,
-            )
+        if not tag_id:
+            _LOGGER.error("Cannot map tag. Tag ID is missing.")
             return
-
-        _LOGGER.info("Mapping tag '%s' to %s '%s'", tag_id, media_type, media_name)
-        self.mappings[tag_id] = {
-            "type": media_type,
-            "name": media_name,
-            "alias": alias or tag_id,
-        }
+        
+        if media_type == "radio":
+            if not uri:
+                _LOGGER.error("Cannot map radio tag. URI is missing.")
+                return
+            _LOGGER.info("Mapping tag '%s' to radio '%s'", tag_id, uri)
+            self.mappings[tag_id] = {
+                "type": media_type,
+                "uri": uri,
+                "alias": alias or tag_id,
+            }
+        else:
+            if not media_name:
+                _LOGGER.error("Cannot map tag. Media Name is missing for type '%s'.", media_type)
+                return
+            _LOGGER.info("Mapping tag '%s' to %s '%s'", tag_id, media_type, media_name)
+            self.mappings[tag_id] = {
+                "type": media_type,
+                "name": media_name,
+                "alias": alias or tag_id,
+            }
 
         mapping_file = self.hass.config.path(DEFAULT_MAPPING_FILE_PATH)
         await self.hass.async_add_executor_job(
@@ -288,10 +342,11 @@ class RFIDJukebox:
         media_type = service_call.data.get("media_type", "playlist")
         media_name = service_call.data.get("media_name")
         alias = service_call.data.get("alias")
-        await self.async_map_tag(tag_id, media_type, media_name, alias)
-
+        uri = service_call.data.get("uri")
+        await self.async_map_tag(tag_id, media_type, media_name, alias, uri)
 
     async def async_map_tag_from_ui(self):
         """Map the last scanned tag from the UI."""
         # This will be updated in a future step to handle the new UI elements.
         pass
+        
